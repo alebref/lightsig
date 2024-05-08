@@ -9,49 +9,77 @@ export interface WritableSignal<T> extends Signal<T> {
   update(fn: (oldValue: T) => T): void;
 }
 
+export interface Effect {
+  destroy(): void;
+}
+
+export class NestedSignalDefinitionError extends Error {}
+
+export class SignalSetByAnotherSignalError extends Error {}
+
 type ConstructorArgs<T> =
   | {
+      type: 'value';
       initialValue: T;
-      compute: null;
     }
+  | { type: 'computed'; compute: () => T }
   | {
-      compute: () => T;
+      type: 'effect';
+      todo: () => void;
     };
 
 export class LightSig<T> {
   private static initializingSignal: LightSig<any> | null = null;
 
-  private value: T;
-  private readonly compute: (() => T) | null;
-  private readonly sinks: LightSig<any>[] = [];
+  private value!: T;
+  private readonly args: ConstructorArgs<T>;
+  private readonly sources = new Set<LightSig<any>>();
+  private readonly sinks = new Set<LightSig<any>>();
 
   private constructor(args: ConstructorArgs<T>) {
+    if (LightSig.initializingSignal !== null) {
+      throw new NestedSignalDefinitionError();
+    }
     LightSig.initializingSignal = this;
-    this.compute = args.compute;
-    if (args.compute !== null) {
-      this.value = args.compute();
-    } else {
-      this.value = args.initialValue;
+    this.args = args;
+    switch (args.type) {
+      case 'value':
+        this.value = args.initialValue;
+        break;
+      case 'computed':
+        this.value = args.compute();
+        break;
+      case 'effect':
+        args.todo();
+        break;
     }
     LightSig.initializingSignal = null;
   }
 
   public static value<T>(initialValue: T): WritableSignal<T> {
-    return new LightSig({ initialValue, compute: null });
+    return new LightSig({ type: 'value', initialValue });
   }
 
   public static computed<T>(compute: () => T): ReadonlySignal<T> {
-    return new LightSig({ compute });
+    return new LightSig({ type: 'computed', compute });
+  }
+
+  public static effect(todo: () => void): Effect {
+    return new LightSig({ type: 'effect', todo });
   }
 
   public get(): T {
     if (LightSig.initializingSignal !== null) {
-      this.sinks.push(LightSig.initializingSignal);
+      this.sinks.add(LightSig.initializingSignal);
+      LightSig.initializingSignal.sources.add(this);
     }
     return this.value;
   }
 
   public set(value: T): void {
+    if (LightSig.initializingSignal !== null) {
+      throw new SignalSetByAnotherSignalError();
+    }
     if (this.value !== value) {
       this.value = value;
       this.notifySinksOnValueChange();
@@ -59,6 +87,9 @@ export class LightSig<T> {
   }
 
   public update(fn: (oldValue: T) => T): void {
+    if (LightSig.initializingSignal !== null) {
+      throw new SignalSetByAnotherSignalError();
+    }
     const newValue = fn(this.value);
     if (this.value !== newValue) {
       this.value = newValue;
@@ -66,18 +97,30 @@ export class LightSig<T> {
     }
   }
 
-  private notifySinksOnValueChange() {
-    for (const sink of this.sinks) {
-      sink.recomputeOnSourceValueChange();
-    }
+  public destroy(): void {
+    this.sources.forEach((source) => {
+      source.sinks.delete(this);
+    });
   }
 
-  private recomputeOnSourceValueChange() {
-    // Only computed signals have sources
-    const newValue = this.compute!();
-    if (this.value !== newValue) {
-      this.value = newValue;
-      this.notifySinksOnValueChange();
+  private notifySinksOnValueChange() {
+    this.sinks.forEach((sink) => {
+      sink.reactOnSourceValueChange();
+    });
+  }
+
+  private reactOnSourceValueChange() {
+    switch (this.args.type) {
+      case 'computed':
+        const newValue = this.args.compute();
+        if (this.value !== newValue) {
+          this.value = newValue;
+          this.notifySinksOnValueChange();
+        }
+        break;
+      case 'effect': {
+        this.args.todo();
+      }
     }
   }
 }
